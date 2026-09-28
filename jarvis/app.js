@@ -15,11 +15,12 @@ const LS = {
   get(k, d) { try { const v = localStorage.getItem('jarvis.' + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem('jarvis.' + k, JSON.stringify(v)); } catch (e) {} },
 };
-const DEF = {clientId: '', geminiKey: '', model: '', name: 'Pankaj', college: '09:00-17:00', reserved: '19:30-21:30', window: '06:00-22:00',
+const DEF = {clientId: '', geminiKey: '', models: '', name: 'Pankaj', college: '09:00-17:00', reserved: '19:30-21:30', window: '06:00-22:00',
   workstreams: ['PhD', 'College', 'Health', 'Brand & career', 'Learning', 'Freelance', 'Books'], inbox: 'Inbox', calendar: 'JARVIS',
   tz: 'Asia/Kolkata', voiceName: '', rate: 1.0, everSignedIn: false};
 let cfg = {...DEF, ...LS.get('settings', {})};
 if (cfg.family) { cfg.reserved = cfg.family; delete cfg.family; LS.set('settings', cfg); }   // v1.3 settings
+if ('model' in cfg) { delete cfg.model; LS.set('settings', cfg); }                           // v1.4 kept one model; v1.5 keeps a list
 const spanOf = s => String(s).split('-').map(x => x.trim().split(':').map(Number));
 const rules = () => ({name: cfg.name, college: spanOf(cfg.college), reserved_time: spanOf(cfg.reserved), day_window: spanOf(cfg.window), workstreams: cfg.workstreams, inbox: cfg.inbox});
 let cache = LS.get('cache', {}), queue = LS.get('queue', []);
@@ -80,24 +81,33 @@ async function flushQueue(lists, calId) {
     queue.shift(); saveQueue();
   }
 }
+/* list ids and the JARVIS calendar id hardly ever change: look them up once every 6 hours, not on every sync (v1.5) */
+async function ids(force) {
+  const names = [cfg.inbox, ...cfg.workstreams];
+  if (!force && cache.idsAt && Date.now() - cache.idsAt < 6 * 3600e3 && names.every(n => (cache.lists || {})[n])) return;
+  const [lists, calId] = await Promise.all([JGoogle.lists(), JGoogle.calendarId(cfg.calendar)]);
+  for (const t of names) if (!lists[t]) lists[t] = (await JGoogle.createList(t)).id;
+  Object.assign(cache, {lists, calId, idsAt: Date.now()}); saveCache();
+}
 async function sync() {
   if (syncing) return syncing;
   syncing = (async () => {
-    const lists = await JGoogle.lists();
-    for (const t of [cfg.inbox, ...cfg.workstreams]) if (!lists[t]) lists[t] = (await JGoogle.createList(t)).id;
-    const calId = await JGoogle.calendarId(cfg.calendar);
-    await flushQueue(lists, calId);
+    await ids(false);
+    try { await flushQueue(cache.lists, cache.calId); }
+    catch (e) { if (e.needAuth) throw e; await ids(true); await flushQueue(cache.lists, cache.calId); }   // a list was renamed or deleted
+    const lists = cache.lists, calId = cache.calId;
     const now = new Date(), start = new Date(now.getFullYear(), now.getMonth(), now.getDate()), end = new Date(start.getTime() + 86400000);
+    const names = [cfg.inbox, ...cfg.workstreams];
+    const [evLists, taskLists] = await Promise.all([                       // both calendars and all lists at the same time
+      Promise.all(['primary', calId].filter(Boolean).map(id => JGoogle.events(id, start, end))),
+      Promise.all(names.map(n => Promise.all([JGoogle.openTasks(lists[n]), JGoogle.doneSince(lists[n], start)]))),
+    ]);
     const evs = [], seen = new Set();
-    for (const id of ['primary', calId].filter(Boolean)) for (const ev of await JGoogle.events(id, start, end)) if (!seen.has(ev.id)) { seen.add(ev.id); evs.push(ev); }
+    for (const list of evLists) for (const ev of list) if (!seen.has(ev.id)) { seen.add(ev.id); evs.push(ev); }
     const open = [], done = [];
-    await Promise.all([cfg.inbox, ...cfg.workstreams].map(async n => {
-      const id = lists[n];
-      const [o, d] = await Promise.all([JGoogle.openTasks(id), JGoogle.doneSince(id, start)]);
-      o.forEach(t => open.push({l: n, id, t})); d.forEach(t => done.push({l: n, id, t}));
-    }));
-    cache = {at: Date.now(), day: ymd(now), calId, lists, events: evs, open, done}; saveCache();
-    try { await JKnowledge.refresh(false); } catch (e) { if (e.needAuth) throw e; }
+    names.forEach((n, i) => { const id = lists[n]; taskLists[i][0].forEach(t => open.push({l: n, id, t})); taskLists[i][1].forEach(t => done.push({l: n, id, t})); });
+    Object.assign(cache, {at: Date.now(), day: ymd(now), events: evs, open, done}); saveCache();
+    JKnowledge.refresh(false).catch(() => {});                             // in the background: the screen never waits for Drive
     lastError = '';
   })().finally(() => { syncing = null; });
   return syncing;
@@ -121,12 +131,13 @@ function view() {
   const status = [
     {name: 'Google sync', status: !cfg.clientId ? 'Offline' : authed ? 'Running' : 'Needs you',
      detail: !cfg.clientId ? 'add your client ID in SETTINGS' : when ? `last sync ${pad(when.getHours())}:${pad(when.getMinutes())}${authed ? '' : ' · tap CONNECT'}` : 'tap CONNECT GOOGLE'},
-    {name: 'Gemini', status: cfg.geminiKey ? 'Running' : 'Offline', detail: cfg.geminiKey ? (cfg.model || 'ready') : 'add your key in SETTINGS'},
+    (() => { const g = JGemini.status(); return {name: 'Gemini', status: cfg.geminiKey ? 'Running' : 'Offline',
+      detail: !cfg.geminiKey ? 'add your key in SETTINGS' : (g.model || 'ready') + (g.resting.length ? ` · ${g.resting.length} busy model resting` : '')}; })(),
     (() => { const k = JKnowledge.status(); return {name: 'Knowledge', status: k.count ? 'Running' : 'Offline',
       detail: k.count ? `${k.count} files from Drive` : k.missing ? 'no JARVIS › Knowledge folder in Drive' : 'syncs after Google sign-in'}; })(),
     ...(queue.length ? [{name: 'Waiting to sync', status: 'Scheduled', detail: `${queue.length} change${queue.length > 1 ? 's' : ''} saved on this phone`}] : []),
-    {name: 'Morning brief', status: t >= 530 ? 'Done' : 'Scheduled', detail: '08:50 via Spark'},
-    {name: 'Evening review', status: t >= 1065 ? 'Done' : 'Scheduled', detail: '17:45 via Spark'},
+    {name: 'Morning brief', status: t >= 530 ? 'Done' : 'Scheduled', detail: '08:50 via JARVIS'},
+    {name: 'Evening review', status: t >= 1065 ? 'Done' : 'Scheduled', detail: '17:45 via JARVIS'},
   ];
   return JPlanner.buildToday(now, fresh ? (cache.events || []) : [], open, done, rules(), status);
 }
@@ -164,10 +175,6 @@ function render() {
 }
 
 /* ---------- actions ---------- */
-async function modelName() {
-  if (!cfg.model) { cfg.model = await JGemini.pickModel(cfg.geminiKey); LS.set('settings', cfg); }
-  return cfg.model;
-}
 function addLocal(op) {                               // show it straight away, send it when Google is reachable
   queue.push(op); saveQueue();
   const lid = (cache.lists || {})[op.list] || 'pending';
@@ -178,23 +185,30 @@ async function pushChanges() {
   if (JGoogle.valid() && navigator.onLine) { try { await sync(); } catch (e) { if (!e.needAuth) lastError = e.message; } }
   render();
 }
+const later = () => { pushChanges(); };                  // send to Google in the background; JARVIS has already answered
 const fmtDay = d => `${DAYS[d.getDay()]} ${d.getDate()} ${MONS[d.getMonth()]}`;
+/* code first (instant, offline too), then Gemini; if Gemini cannot be reached, an add is saved to the Inbox for later */
+async function understand(text) {
+  const q = JQuick.parse(text, cfg.workstreams, cfg.inbox);
+  if (q) return q;
+  if (!cfg.geminiKey) throw new Error('Please add your Gemini key in SETTINGS first.');
+  return JGemini.parseCommand(cfg.geminiKey, text, rules());
+}
 async function command(text) {
   text = text.trim(); if (!text) return;
   phase('thinking'); $('caption').textContent = '“' + text + '”';
-  if (!cfg.geminiKey) return say('Please add your Gemini key in SETTINGS first.');
   let cmd;
-  try { cmd = await JGemini.parseCommand(cfg.geminiKey, await modelName(), text, rules()); }
+  try { cmd = await understand(text); }
   catch (e) {
-    if (!navigator.onLine) { addLocal({op: 'add', list: cfg.inbox, title: text, notes: 'P2 · 30 min · added by JARVIS phone (offline)', due: null}); render(); return say('No internet. I saved it to your Inbox and will sync it later.'); }
-    if (/model|not found|404/i.test(e.message)) { cfg.model = ''; LS.set('settings', cfg); }
+    if (!navigator.onLine || /No internet/.test(e.message)) { addLocal({op: 'add', list: cfg.inbox, title: text, notes: 'P2 · 30 min · added by JARVIS phone (offline)', due: null}); render(); later(); return say('No internet. I saved it to your Inbox and will sync it later.'); }
     phase('idle'); return say('Sorry, that did not work: ' + e.message);
   }
   if (cmd.intent === 'add_task') {
     const now = new Date(), today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     let due = JDates.resolveDate(cmd.when, now) || JDates.resolveDate(text, now);
     const tm = JDates.resolveTime(cmd.time) || JDates.resolveTime(text);
-    const mins = Math.max(5, parseInt(cmd.duration_min, 10) || 30), prio = cmd.priority || 'P2', ws = cmd.workstream || cfg.inbox;
+    const mins = Math.max(5, parseInt(cmd.duration_min, 10) || 30), prio = cmd.priority || 'P2';
+    const ws = [...cfg.workstreams, cfg.inbox].includes(cmd.workstream) ? cmd.workstream : cfg.inbox;
     const title = (cmd.title || text).trim();
     let event = null, resNote = '';
     if (tm) {
@@ -205,15 +219,21 @@ async function command(text) {
       if (sm < f1[0] * 60 + f1[1] && sm + mins > f0[0] * 60 + f0[1]) resNote = ' Note: that is inside your reserved time.';
     }
     addLocal({op: 'add', list: ws, title, notes: `${prio} · ${mins} min · added by JARVIS phone`, due: due ? ymd(due) : null, event});
-    await pushChanges();
+    render();                                                  // on screen straight away (marked SYNCING until Google has it)
     const whenTxt = due ? `Due ${fmtDay(due)}` : 'No date';
-    return say(`Added to ${ws}: ${title}. ${whenTxt}${event ? `, with a reminder at ${pad(tm.h)}:${pad(tm.m)} in your JARVIS calendar` : ''}, ${prio}.${resNote}` +
-               (queue.length ? ' It will reach Google when you are online and signed in.' : ''));
+    say(`Added to ${ws}: ${title}. ${whenTxt}${event ? `, with a reminder at ${pad(tm.h)}:${pad(tm.m)} in your JARVIS calendar` : ''}, ${prio}.${resNote}` +
+        (JGoogle.valid() && navigator.onLine ? '' : ' It will reach Google when you are online and signed in.'));
+    return later();
   }
-  if (cmd.intent === 'brief') { await pushChanges(); return say(data.brief); }
+  if (cmd.intent === 'brief') {
+    if (!cache.at || Date.now() - cache.at > 120000) await pushChanges();   // older than 2 minutes: fetch first
+    else render();
+    return say(data.brief);
+  }
   if (cmd.intent === 'write') { openWriter(cmd.kind || 'other', text); return runWriter(); }
-  try { say(await JGemini.answer(cfg.geminiKey, await modelName(), text, rules(), JKnowledge.context('question', text).text)); }
-  catch (e) { say('Sorry, I could not answer: ' + e.message); }
+  if (!cfg.geminiKey) return say('Please add your Gemini key in SETTINGS first.');
+  try { say(await JGemini.answer(cfg.geminiKey, text, rules(), JKnowledge.context('question', text).text)); }
+  catch (e) { phase('idle'); say('Sorry, I could not answer: ' + e.message); }
 }
 
 $('askForm').onsubmit = e => { e.preventDefault(); const t = $('ask').value; $('ask').value = ''; ensureAuth(); command(t); };
@@ -229,7 +249,10 @@ document.addEventListener('click', async e => {
     render(); if (undo !== '1') say('Marked done. Well done.');
     pushChanges();
   }
-  if (e.target.closest('[data-brief]') && data) { ensureAuth().then(() => pushChanges()).then(() => say(data.brief)); }
+  if (e.target.closest('[data-brief]') && data) {
+    if (cache.at && Date.now() - cache.at < 120000) { say(data.brief); ensureAuth(); }
+    else ensureAuth().then(() => pushChanges()).then(() => say(data.brief));
+  }
   if (e.target.closest('[data-connect]')) { const ok = await ensureAuth(); if (ok) { $('caption').textContent = 'Syncing…'; await refresh(false); say(data.brief); } }
   if (e.target.closest('[data-settings]')) openSettings();
 });
@@ -266,10 +289,10 @@ async function runWriter() {
   try {
     if (JGoogle.valid()) { try { await JKnowledge.refresh(false); } catch (e) {} }
     const ctx = JKnowledge.context(kind, req);
-    const out = await JGemini.write(cfg.geminiKey, await modelName(), kind, req, rules(), ctx.text);
+    const out = await JGemini.write(cfg.geminiKey, kind, req, rules(), ctx.text);
     $('wOut').textContent = out;
     const words = out.split('---')[0].trim().split(/\s+/).length;
-    $('wMsg').textContent = `${words} words · used ${ctx.names.length ? ctx.names.join(', ') : 'no knowledge files (sign in to Google to load them)'}`;
+    $('wMsg').textContent = `${words} words · ${JGemini.status().model} · used ${ctx.names.length ? ctx.names.join(', ') : 'no knowledge files (sign in to Google to load them)'}`;
     say(`Draft ready: about ${words} words, on screen. Check the list at the end before you use it.`);
   } catch (e) { phase('idle'); $('wMsg').textContent = 'Writing failed: ' + e.message; }
 }
@@ -290,7 +313,7 @@ function fillVoiceSelect() {
 function openSettings() {
   $('sClient').value = cfg.clientId; $('sKey').value = cfg.geminiKey; $('sName').value = cfg.name;
   $('sCollege').value = cfg.college; $('sReserved').value = cfg.reserved; $('sRate').value = cfg.rate; $('sRateOut').textContent = Number(cfg.rate).toFixed(2) + '×';
-  fillVoiceSelect(); $('sMsg').textContent = cfg.model ? `Gemini model: ${cfg.model}` : '';
+  fillVoiceSelect(); $('sMsg').textContent = cfg.models ? `Gemini · ${cfg.models}` : '';
   $('vpanel').hidden = false; $('settingsBtn').setAttribute('aria-expanded', 'true'); $('sClient').focus();
 }
 function closeSettings() { $('vpanel').hidden = true; $('settingsBtn').setAttribute('aria-expanded', 'false'); $('settingsBtn').focus(); }
@@ -309,11 +332,14 @@ $('sSave').onclick = async () => {
   const keyChanged = $('sKey').value.trim() !== cfg.geminiKey, idChanged = id !== cfg.clientId;
   Object.assign(cfg, {clientId: $('sClient').value.trim(), geminiKey: $('sKey').value.trim(), name: $('sName').value.trim() || 'Pankaj',
     college: $('sCollege').value.trim(), reserved: $('sReserved').value.trim(), voiceName: $('sVoice').value, rate: Number($('sRate').value)});
-  if (keyChanged) cfg.model = '';
+  if (keyChanged) cfg.models = '';
   if (idChanged) { JGoogle.signOut(); cfg.everSignedIn = false; }
   LS.set('settings', cfg);
   $('sMsg').textContent = 'Saved.';
-  if (cfg.geminiKey && !cfg.model) { try { $('sMsg').textContent = 'Checking your Gemini key…'; await modelName(); $('sMsg').textContent = `Saved. Gemini model: ${cfg.model}`; } catch (e) { $('sMsg').textContent = 'Gemini key problem: ' + e.message; } }
+  if (cfg.geminiKey && !cfg.models) {
+    try { $('sMsg').textContent = 'Checking your Gemini key…'; cfg.models = await JGemini.check(cfg.geminiKey); LS.set('settings', cfg); $('sMsg').textContent = `Saved. Gemini · ${cfg.models}`; }
+    catch (e) { $('sMsg').textContent = 'Gemini key problem: ' + e.message; }
+  }
   if (cfg.clientId && gisReady) { try { JGoogle.init(cfg.clientId); } catch (e) {} }
   render(); say('Settings saved.');
 };
